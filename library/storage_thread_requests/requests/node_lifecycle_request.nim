@@ -4,7 +4,6 @@
 ## STOP_NODE: stop the provided Logos Storage node.
 
 import std/[options, strutils, net, os]
-import codexdht/discv5/spr
 import std/parseutils
 import contractabi/address
 import chronos
@@ -27,8 +26,6 @@ from ../../../storage/storage import StorageServer, new, start, stop, close
 logScope:
   topics = "libstorage libstoragelifecycle"
 
-const LibstorageDisableRestApi* {.booldefine.} = true
-
 type NodeLifecycleMsgType* = enum
   CREATE_NODE
   START_NODE
@@ -48,13 +45,6 @@ proc readValue*(r: var JsonReader, val: var NatConfig) =
   if res.isErr:
     raise
       newException(SerializationError, "Cannot parse the NAT config: " & res.error())
-  val = res.get()
-
-proc readValue*(r: var JsonReader, val: var SignedPeerRecord) =
-  let res = SignedPeerRecord.parse(r.readValue(string))
-  if res.isErr:
-    raise
-      newException(SerializationError, "Cannot parse the signed peer: " & res.error())
   val = res.get()
 
 proc readValue*(r: var JsonReader, val: var ThreadCount) =
@@ -150,12 +140,6 @@ proc createStorage(
   if privateKey.isErr:
     return err("Failed to create Storage: unable to get the private key.")
   let pk = privateKey.get()
-
-  when LibstorageDisableRestApi:
-    conf.apiBindAddress = string.none
-    debug "Rest API is disabled!"
-  else:
-    debug "Rest API is enabled!"
 
   let server =
     try:

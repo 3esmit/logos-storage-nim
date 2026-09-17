@@ -9,13 +9,20 @@
 
 {.push raises: [].}
 
+import std/options
+import std/sequtils
+
 import pkg/chronos
 import pkg/libp2p/cid
+import pkg/libp2p/peerinfo
+import pkg/libp2p/protocols/connectivity/autonat/types
+import pkg/libp2p/protocols/connectivity/autonatv2/service
 import pkg/metrics
 import pkg/questionable
 import pkg/questionable/results
 
 import ../../utils
+import ../../utils/addrutils
 import ../../utils/exceptions
 import ../../utils/trackedfutures
 import ../../discovery
@@ -36,6 +43,7 @@ type Advertiser* = ref object of RootObj
   localStore*: BlockStore # Local block store for this instance
   discovery*: Discovery # Discovery interface
 
+  advertiseContent: bool # Announce local or downloaded content
   advertiserRunning*: bool # Indicates if discovery is running
   concurrentAdvReqs: int # Concurrent advertise requests
 
@@ -46,6 +54,8 @@ type Advertiser* = ref object of RootObj
   advertiseLocalStoreLoopSleep: Duration # Advertise loop sleep
   inFlightAdvReqs*: Table[Cid, Future[void]] # Inflight advertise requests
   addrChanged: AsyncEvent # Fired when the announced addresses change
+  peerInfo: PeerInfo
+  autonat: Option[AutonatV2Service]
 
 proc addCidToQueue(b: Advertiser, cid: Cid) {.async: (raises: [CancelledError]).} =
   if cid notin b.advertiseQueue:
@@ -68,17 +78,28 @@ proc advertiseBlock(b: Advertiser, cid: Cid) {.async: (raises: [CancelledError])
   except CatchableError as e:
     error "failed to advertise block", cid, error = e.msgDetail
 
+proc reachable(b: Advertiser): bool =
+  let nodeReachable =
+    b.autonat.isNone or b.autonat.get.networkReachability.isReachable()
+  nodeReachable or b.peerInfo.addrs.anyIt(it.isDialableCircuitMA())
+
+proc onAddrChange*(b: Advertiser) =
+  b.addrChanged.fire()
+
 proc advertiseLocalStoreLoop(b: Advertiser) {.async: (raises: []).} =
   try:
     while b.advertiserRunning:
       b.addrChanged.clear()
 
-      if cidsIter =? await b.localStore.listBlocks(blockType = BlockType.Manifest):
-        trace "Advertiser begins iterating blocks..."
-        for c in cidsIter:
-          if cid =? await c:
-            await b.advertiseBlock(cid)
-        trace "Advertiser iterating blocks finished."
+      if b.reachable():
+        if cidsIter =? await b.localStore.listBlocks(blockType = BlockType.Manifest):
+          trace "Advertiser begins iterating blocks..."
+          for c in cidsIter:
+            if cid =? await c:
+              await b.advertiseBlock(cid)
+          trace "Advertiser iterating blocks finished."
+      else:
+        trace "No reachable address yet, skipping advertise sweep"
 
       discard await b.addrChanged.wait().withTimeout(b.advertiseLocalStoreLoopSleep)
   except CancelledError:
@@ -92,6 +113,9 @@ proc processQueueLoop(b: Advertiser) {.async: (raises: []).} =
       let cid = await b.advertiseQueue.get()
 
       if cid in b.inFlightAdvReqs:
+        continue
+
+      if not b.reachable():
         continue
 
       let request = b.discovery.provide(cid)
@@ -114,6 +138,10 @@ proc start*(b: Advertiser) {.async: (raises: []).} =
 
   trace "Advertiser start"
 
+  if not b.advertiseContent:
+    info "Content advertising is disabled, this node will not become a provider"
+    return
+
   # The advertiser is expected to be started only once.
   if b.advertiserRunning:
     raiseAssert "Advertiser can only be started once — this should not happen"
@@ -128,8 +156,6 @@ proc start*(b: Advertiser) {.async: (raises: []).} =
   b.localStore.onBlockStored = onBlock.some
 
   b.advertiserRunning = true
-  b.discovery.onAddrChange = proc() {.gcsafe, raises: [].} =
-    b.addrChanged.fire()
   for i in 0 ..< b.concurrentAdvReqs:
     let fut = b.processQueueLoop()
     b.trackedFutures.track(fut)
@@ -142,6 +168,10 @@ proc stop*(b: Advertiser) {.async: (raises: []).} =
   ##
 
   trace "Advertiser stop"
+
+  if not b.advertiseContent:
+    return
+
   if not b.advertiserRunning:
     warn "Stopping advertiser without starting it"
     return
@@ -149,7 +179,6 @@ proc stop*(b: Advertiser) {.async: (raises: []).} =
   b.advertiserRunning = false
   # Stop incoming tasks from callback and localStore loop
   b.localStore.onBlockStored = CidCallback.none
-  b.discovery.onAddrChange = nil
   trace "Stopping advertise loop and tasks"
   await b.trackedFutures.cancelTracked()
   trace "Advertiser loop and tasks stopped"
@@ -158,14 +187,20 @@ proc new*(
     T: type Advertiser,
     localStore: BlockStore,
     discovery: Discovery,
+    peerInfo: PeerInfo,
+    autonat = none(AutonatV2Service),
     concurrentAdvReqs = DefaultConcurrentAdvertRequests,
     advertiseLocalStoreLoopSleep = DefaultAdvertiseLoopSleep,
+    advertiseContent = true,
 ): Advertiser =
   ## Create a advertiser instance
   ##
   Advertiser(
     localStore: localStore,
     discovery: discovery,
+    peerInfo: peerInfo,
+    advertiseContent: advertiseContent,
+    autonat: autonat,
     concurrentAdvReqs: concurrentAdvReqs,
     advertiseQueue: newAsyncQueue[Cid](concurrentAdvReqs),
     trackedFutures: TrackedFutures.new(),

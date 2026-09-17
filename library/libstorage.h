@@ -88,7 +88,6 @@ extern "C"
     //  "id": "...",
     //  "addrs": ["..."],
     //  "spr": "",
-    //  "providerAddresses": ["..."],
     //  "table": {
     //   "localNode": "",
     //   "nodes": [
@@ -116,6 +115,13 @@ extern "C"
     // Peer Identity reference as specified at
     // https://docs.libp2p.io/concepts/fundamentals/peers/
     int storage_peer_id(
+        void *ctx,
+        StorageCallback callback,
+        void *userData);
+
+    // Get the name of the network preset configured.
+    // Example "logos.test".
+    int storage_network(
         void *ctx,
         StorageCallback callback,
         void *userData);

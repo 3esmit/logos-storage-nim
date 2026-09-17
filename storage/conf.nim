@@ -26,6 +26,7 @@ import pkg/chronicles/helpers
 import pkg/chronicles/topics_registry
 import pkg/confutils/defs
 import pkg/confutils/std/net
+import pkg/json_serialization
 import pkg/toml_serialization
 import pkg/toml_serialization/lexer
 import pkg/metrics
@@ -36,6 +37,7 @@ import pkg/questionable
 import pkg/questionable/results
 
 import ./storagetypes
+import ./utils/spr
 import ./discovery
 import ./logutils
 import ./stores
@@ -78,6 +80,7 @@ const
   storage_enable_log_counter* {.booldefine.} = false
 
   DefaultThreadCount* = ThreadCount(0)
+  DefaultApiBindAddress* = "127.0.0.1"
 
 type
   StartUpCmd* {.pure.} = enum
@@ -167,14 +170,6 @@ type
       name: "nat"
     .}: NatConfig
 
-    discoveryPort* {.
-      desc: "Discovery (UDP) port",
-      defaultValue: 8090.Port,
-      defaultValueDesc: "8090",
-      abbr: "u",
-      name: "disc-port"
-    .}: Port
-
     netPrivKeyFile* {.
       desc: "Source of network (secp256k1) private key file path or name",
       defaultValue: "key",
@@ -258,8 +253,10 @@ type
 
     apiBindAddress* {.
       desc: "The REST API bind address",
-      defaultValue: "127.0.0.1".some,
-      name: "api-bindaddr"
+      defaultValue: string.none,
+      defaultValueDesc: DefaultApiBindAddress,
+      name: "api-bindaddr",
+      hidden
     .}: Option[string]
 
     apiPort* {.
@@ -267,7 +264,8 @@ type
       defaultValue: 8080.Port,
       defaultValueDesc: "8080",
       name: "api-port",
-      abbr: "p"
+      abbr: "p",
+      hidden
     .}: Port
 
     apiCorsAllowedOrigin* {.
@@ -276,7 +274,8 @@ type
         "'*' will allow all origins, '' will allow none.",
       defaultValue: string.none,
       defaultValueDesc: "Disallow all cross origin requests to download data",
-      name: "api-cors-origin"
+      name: "api-cors-origin",
+      hidden
     .}: Option[string]
 
     repoKind* {.
@@ -324,6 +323,14 @@ type
       defaultValueDesc: $DefaultBlockRetries,
       name: "block-retries"
     .}: int
+
+    advertiseContent* {.
+      desc:
+        "Announce the content to the DHT and become a provider for this content, " &
+        "disable with --advertise-content=false",
+      defaultValue: true,
+      name: "advertise-content"
+    .}: bool
 
     discoveryTableIpLimit* {.
       desc: "Maximum number of nodes with the same IP in the discovery routing table",
@@ -535,7 +542,7 @@ proc parseCmdArg*(
   let res = SignedPeerRecord.parse(uri)
   if res.isErr:
     raise newException(
-      ConfigurationError, "Cannot parse the signed peer " & uri & ": " & res.error()
+      ConfigurationError, "Cannot parse the signed peer " & uri & ": " & res.error.msg
     )
   return res.get()
 
@@ -599,6 +606,18 @@ proc readValue*(
     val = SignedPeerRecord.parseCmdArg(uri)
   except CatchableError as err:
     r.lex.raiseTomlErr(err.msg)
+
+proc readValue*(
+    r: var JsonReader, val: var SignedPeerRecord
+) {.raises: [SerializationError, IOError].} =
+  let
+    input = r.readValue(string)
+    res = SignedPeerRecord.parse(input)
+
+  if res.isErr:
+    r.raiseUnexpectedValue("Invalid SignedPeerRecord: " & res.error.msg)
+
+  val = res.get()
 
 proc readValue*(
     r: var TomlReader, val: var MultiAddress
@@ -711,7 +730,7 @@ proc updateLogLevel*(logLevel: string) {.raises: [ValueError].} =
   # Updates log levels (without clearing old ones)
   let directives = logLevel.split(";")
   try:
-    setLogLevel(parseEnum[LogLevel](directives[0].toUpperAscii))
+    topics_registry.setLogLevel(parseEnum[LogLevel](directives[0].toUpperAscii))
   except ValueError:
     raise (ref ValueError)(
       msg:
